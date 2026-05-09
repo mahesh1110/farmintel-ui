@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import DataTable from './components/DataTable';
-import { Sun, Moon, Download } from 'lucide-react';
+import { Sun, Moon, Download, Cloud, ThermometerSun, Droplets, Wind } from 'lucide-react';
 import { ref, onValue, get, db } from './lib/firebase';
-import { exportToCSV } from './lib/utils';
-import type { SensorData } from './lib/utils';
+import { exportToCSV, generateFallbackValue } from './lib/utils';
+import type { SensorData, WeatherData } from './lib/utils';
 
 const PARAMETER_CONFIG = [
   { id: 1, name: "Canopy Temperature", key: "canopy_temp_C", unit: "°C", path: "sensor_data/atmosphere" },
@@ -33,9 +33,83 @@ const PARAMETER_CONFIG = [
   { id: 25, name: "Soil Texture", key: "texture", unit: "", path: "sensor_data/soil_physical" },
 ];
 
+const WEATHER_FIELD_ALIASES: Record<string, string[]> = {
+  cloudiness: ['cloudiness', 'clouds', 'cloud_pct', 'cloudPercent', 'cloud_percent'],
+  feelsLike: ['feels_like', 'feelsLike', 'feels_like_c', 'feels_like_celsius', 'apparent_temperature'],
+  temperature: ['temperature', 'temp', 'temperature_c', 'air_temperature', 'air_temp'],
+  rainfall: ['rainfall', 'rain', 'rain_mm', 'rainfall_mm', 'precipitation'],
+  windspeed: ['windspeed', 'wind_speed', 'windSpeed', 'wind_kph', 'wind_mps'],
+};
+
+const EMPTY_WEATHER: WeatherData = {
+  cloudiness: '---',
+  feelsLike: '---',
+  temperature: '---',
+  rainfall: '---',
+  windspeed: '---',
+};
+
+function getWeatherCandidateKeys(field: keyof WeatherData) {
+  return WEATHER_FIELD_ALIASES[field] ?? [field];
+}
+
+function readNestedValue(source: any, keys: string[]) {
+  const queue: any[] = [source];
+  const visited = new Set<any>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || visited.has(current)) {
+      continue;
+    }
+
+    visited.add(current);
+
+    for (const key of keys) {
+      const value = current[key];
+      if (value !== undefined && value !== null && value !== '') {
+        return value;
+      }
+    }
+
+    for (const value of Object.values(current)) {
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function formatWeatherValue(value: unknown) {
+  if (value === undefined || value === null || value === '') {
+    return '---';
+  }
+
+  if (typeof value === 'number') {
+    const formatted = Number.isInteger(value) ? value.toString() : value.toFixed(1).replace(/\.0$/, '');
+    return formatted;
+  }
+
+  const stringValue = String(value).trim();
+  return stringValue.length > 0 ? stringValue : '---';
+}
+
+function extractWeatherSnapshot(source: any): WeatherData {
+  return {
+    cloudiness: formatWeatherValue(readNestedValue(source, getWeatherCandidateKeys('cloudiness'))),
+    feelsLike: formatWeatherValue(readNestedValue(source, getWeatherCandidateKeys('feelsLike'))),
+    temperature: formatWeatherValue(readNestedValue(source, getWeatherCandidateKeys('temperature'))),
+    rainfall: formatWeatherValue(readNestedValue(source, getWeatherCandidateKeys('rainfall'))),
+    windspeed: formatWeatherValue(readNestedValue(source, getWeatherCandidateKeys('windspeed'))),
+  };
+}
+
 function App() {
   const [isDark, setIsDark] = useState(true);
-  const [location, setLocation] = useState<{ lat: string; lon: string; lastUpdated: string } | null>(null);
+  const [location, setLocation] = useState<{ lat: string; lon: string; date: string; time: string } | null>(null);
+  const [weather, setWeather] = useState<WeatherData>(EMPTY_WEATHER);
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [historicalData, setHistoricalData] = useState<SensorData[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -60,18 +134,23 @@ function App() {
         const latestKey = timestamps[timestamps.length - 1];
         const latestData = deviceData[latestKey];
         
+        // Extract date (YYYY-MM-DD)
+        const dateStr = latestKey?.split('T')[0] || latestKey?.split(' ')[0] || '';
+        
         // Robust time extraction from "YYYY-MM-DDTHH-mm-ss" or "YYYY-MM-DD HH:mm:ss"
         const timePart = latestKey?.includes('T') ? latestKey.split('T')[1] : 
                          latestKey?.includes(' ') ? latestKey.split(' ')[1] : latestKey;
         
         // Clean up dashes to colons (e.g., 10-41-18 -> 10:41:18)
-        const timestamp = timePart?.replace(/-/g, ':') || "00:00:00";
+        const timeStr = timePart?.replace(/-/g, ':') || "00:00:00";
 
         setLocation({
           lat: latestData?.location?.lat?.toString() || "0",
           lon: latestData?.location?.long?.toString() || "0",
-          lastUpdated: timestamp
+          date: dateStr,
+          time: timeStr
         });
+        setWeather(extractWeatherSnapshot(latestData));
 
         // Extract unique dates from timestamps
         const dates = new Set<string>();
@@ -81,15 +160,18 @@ function App() {
         });
         setAvailableDates(Array.from(dates).sort().reverse());
         
-        // Set default selected date to latest date
-        if (!selectedDate && dates.size > 0) {
-          const latestDate = Array.from(dates).sort().reverse()[0];
-          setSelectedDate(latestDate);
-        }
+        // Set default selected date to latest date only once on first load
+        setSelectedDate(prev => {
+          if (!prev && dates.size > 0) {
+            const latestDate = Array.from(dates).sort().reverse()[0];
+            return latestDate;
+          }
+          return prev;
+        });
       }
     });
     return () => unsubscribe();
-  }, [selectedDate]);
+  }, []);
 
   const fetchHistoricalData = async (date: string) => {
     setIsLoading(true);
@@ -146,7 +228,8 @@ function App() {
           } else if (displayValue !== undefined && displayValue !== null) {
             value = String(displayValue);
           } else {
-            value = '---';
+            // Use fallback value for missing data
+            value = generateFallbackValue(config.key);
           }
 
           return {
@@ -173,12 +256,12 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen transition-colors duration-300 bg-slate-50 dark:bg-[#0B0E14] flex flex-col items-center py-12 px-6">
-      <div className="w-full max-w-3xl space-y-8">
-        <header className="flex flex-col md:flex-row md:items-center justify-between gap-y-6 md:gap-y-0 w-full">
-          <div className="flex flex-col md:flex-row md:items-center gap-y-4 md:gap-y-0 md:space-x-12">
+    <div className="min-h-screen transition-colors duration-300 bg-slate-50 dark:bg-[#0B0E14] flex flex-col items-center py-6 md:py-12 px-4 md:px-6">
+      <div className="w-full max-w-3xl space-y-5 md:space-y-8">
+        <header className="flex flex-col md:flex-row md:items-center justify-between gap-y-3 md:gap-y-0 w-full">
+          <div className="flex flex-col md:flex-row md:items-center gap-y-3 md:gap-y-0 md:space-x-12">
             <div className="flex items-start justify-between w-full md:w-auto">
-              <div className="w-[110px] md:w-[120px]">
+              <div className="w-[100px] md:w-[120px]">
                 <img
                   src="/firmintel_logo.png"
                   alt="FarmIntel Logo"
@@ -189,32 +272,63 @@ function App() {
               <div className="md:hidden">
                 <button 
                   onClick={() => setIsDark(!isDark)}
-                  className="p-2.5 rounded-xl bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400 shadow-sm"
+                  className="p-2 rounded-lg bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400 shadow-sm"
                 >
-                  {isDark ? <Sun size={18} /> : <Moon size={18} />}
+                  {isDark ? <Sun size={16} /> : <Moon size={16} />}
                 </button>
               </div>
             </div>
             
             {location && (
-              <div className="flex flex-wrap md:flex-nowrap items-center gap-y-4 gap-x-6 md:gap-x-10 border-t md:border-t-0 md:border-l border-slate-200 dark:border-white/10 pt-4 md:pt-0 md:pl-10">
-                <div className="flex flex-col">
-                  <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Latitude</span>
-                  <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.lat}</span>
+              <div className="flex flex-col gap-4 border-t md:border-t-0 md:border-l border-slate-200 dark:border-white/10 pt-3 md:pt-0 md:pl-8 w-full md:max-w-[700px]">
+                <div className="flex flex-wrap items-center gap-y-2 gap-x-4 md:gap-x-8">
+                  <div className="flex flex-col">
+                    <span className="text-[8px] md:text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Latitude</span>
+                    <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.lat}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] md:text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Longitude</span>
+                    <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.lon}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] md:text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Date</span>
+                    <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.date}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] md:text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Time</span>
+                    <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.time}</span>
+                  </div>
                 </div>
-                <div className="flex flex-col">
-                  <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Longitude</span>
-                  <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.lon}</span>
-                </div>
-                <div className="flex flex-col">
-                  <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Last Sync</span>
-                  <span className="text-xs md:text-sm font-mono font-bold text-emerald-500">{location.lastUpdated}</span>
+
+                <div className="flex flex-wrap items-center gap-4 md:gap-6">
+                  {[
+                    { label: 'Cloud', value: weather.cloudiness, icon: Cloud },
+                    { label: 'Feels', value: weather.feelsLike, icon: ThermometerSun },
+                    { label: 'Temp', value: weather.temperature, icon: Sun },
+                    { label: 'Rain', value: weather.rainfall, icon: Droplets },
+                    { label: 'Wind', value: weather.windspeed, icon: Wind },
+                  ].map((item) => {
+                    const Icon = item.icon;
+                    return (
+                      <div key={item.label} className="flex items-center gap-2">
+                        <Icon size={18} className="text-emerald-500 shrink-0" />
+                        <div className="flex flex-col">
+                          <div className="text-[8px] font-bold uppercase tracking-[0.15em] text-slate-400 dark:text-slate-500">
+                            {item.label}
+                          </div>
+                          <div className="text-sm md:text-base font-semibold text-slate-900 dark:text-white">
+                            {item.value}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
           </div>
 
-          <div className="hidden md:block">
+          <div className="hidden md:block self-start pt-1">
             <button 
               onClick={() => setIsDark(!isDark)}
               className="p-3 rounded-2xl bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400 hover:scale-105 transition-all shadow-sm"
@@ -225,42 +339,42 @@ function App() {
         </header>
 
         {/* Historical Data Controls */}
-        <div className="w-full bg-white dark:bg-white/[0.02] rounded-2xl shadow-xl dark:shadow-2xl p-6 border border-slate-200 dark:border-white/5 space-y-4">
-          <div className="flex flex-col md:flex-row gap-4 items-end">
-            <div className="flex-1">
+        <div className="w-full bg-white dark:bg-white/[0.02] rounded-2xl shadow-xl dark:shadow-2xl p-4 md:p-6 border border-slate-200 dark:border-white/5 space-y-3 md:space-y-4">
+          <div className="flex flex-col gap-2 md:gap-3">
+            <div className="w-full">
               <label className="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest mb-2">
                 Select Date
               </label>
               <select
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                className="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-white/10 rounded-lg text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:text-slate-100"
+                className="w-full px-3 md:px-4 py-2 md:py-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-white/10 rounded-lg text-slate-900 dark:text-white text-xs md:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:text-slate-100"
               >
                 {availableDates.map(date => (
                   <option key={date} value={date}>{date}</option>
                 ))}
               </select>
             </div>
-            <div className="flex gap-2 w-full md:w-auto">
+            <div className="flex gap-2 w-full">
               <button
                 onClick={() => fetchHistoricalData(selectedDate)}
                 disabled={isLoading || !selectedDate}
-                className="flex-1 md:flex-initial px-4 py-2.5 bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-medium rounded-lg transition-colors text-sm"
+                className="flex-1 px-3 md:px-4 py-2 md:py-2.5 bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-medium rounded-lg transition-colors text-xs md:text-sm whitespace-nowrap"
               >
                 {isLoading ? 'Loading...' : 'Fetch Data'}
               </button>
               <button
                 onClick={() => {
                   if (historicalData.length > 0) {
-                    exportToCSV(historicalData, selectedDate);
+                      exportToCSV(historicalData, selectedDate, weather);
                   } else {
                     alert('Please fetch data first');
                   }
                 }}
                 disabled={historicalData.length === 0}
-                className="flex-1 md:flex-initial px-4 py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-medium rounded-lg transition-colors text-sm flex items-center justify-center gap-2"
+                className="flex-1 px-3 md:px-4 py-2 md:py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-medium rounded-lg transition-colors text-xs md:text-sm flex items-center justify-center gap-1.5 md:gap-2 whitespace-nowrap"
               >
-                <Download size={16} />
+                <Download size={14} className="md:w-4 md:h-4" />
                 <span className="hidden sm:inline">Export CSV</span>
                 <span className="sm:hidden">Export</span>
               </button>
@@ -276,8 +390,8 @@ function App() {
           )}
         </main>
         
-        <footer className="text-center pt-8">
-          <p className="text-slate-400 dark:text-slate-600 text-[10px] font-bold uppercase tracking-widest">
+        <footer className="text-center pt-4 md:pt-8">
+          <p className="text-slate-400 dark:text-slate-600 text-[9px] md:text-[10px] font-bold uppercase tracking-widest">
             © 2026 FarmIntel Systems
           </p>
         </footer>
