@@ -106,6 +106,51 @@ function extractWeatherSnapshot(source: any): WeatherData {
   };
 }
 
+function csvCell(value: unknown) {
+  if (value === undefined || value === null) {
+    return '""';
+  }
+
+  if (typeof value === 'object') {
+    return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+  }
+
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+function flattenRecord(source: any, parentKey = '', output: Record<string, unknown> = {}) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    if (parentKey) {
+      output[parentKey] = Array.isArray(source) ? JSON.stringify(source) : source;
+    }
+    return output;
+  }
+
+  Object.entries(source).forEach(([key, value]) => {
+    const nextKey = parentKey ? `${parentKey}.${key}` : key;
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      flattenRecord(value, nextKey, output);
+      return;
+    }
+
+    output[nextKey] = Array.isArray(value) ? JSON.stringify(value) : value;
+  });
+
+  return output;
+}
+
+function extractDateFromTimestamp(timestamp: string) {
+  if (timestamp.includes('T')) {
+    return timestamp.split('T')[0];
+  }
+
+  if (timestamp.includes(' ')) {
+    return timestamp.split(' ')[0];
+  }
+
+  return timestamp;
+}
+
 function App() {
   const [isDark, setIsDark] = useState(true);
   const [location, setLocation] = useState<{ lat: string; lon: string; date: string; time: string } | null>(null);
@@ -113,6 +158,7 @@ function App() {
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [historicalData, setHistoricalData] = useState<SensorData[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isFullExporting, setIsFullExporting] = useState(false);
   const [showHistorical, setShowHistorical] = useState(false);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
 
@@ -255,6 +301,66 @@ function App() {
     }
   };
 
+  const exportCompleteDayCSV = async () => {
+    if (isFullExporting || !selectedDate) {
+      return;
+    }
+
+    setIsFullExporting(true);
+    try {
+      const deviceRef = ref(db, 'device_001');
+      const snapshot = await get(deviceRef);
+      const deviceData = snapshot.val();
+
+      if (!deviceData) {
+        return;
+      }
+
+      const timestamps = Object.keys(deviceData)
+        .filter((timestamp) => extractDateFromTimestamp(timestamp) === selectedDate)
+        .sort();
+
+      if (timestamps.length === 0) {
+        return;
+      }
+
+      const rows = timestamps.map((timestamp) => {
+        const flattened = flattenRecord(deviceData[timestamp]);
+        return {
+          timestamp,
+          ...flattened,
+        };
+      });
+
+      const allHeaders = new Set<string>();
+      rows.forEach((row) => {
+        Object.keys(row).forEach((key) => allHeaders.add(key));
+      });
+
+      const headers = ['timestamp', ...Array.from(allHeaders).filter((h) => h !== 'timestamp').sort()];
+      const csvLines = [headers.map((header) => csvCell(header)).join(',')];
+
+      rows.forEach((row) => {
+        const line = headers.map((header) => csvCell((row as Record<string, unknown>)[header])).join(',');
+        csvLines.push(line);
+      });
+
+      const blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `farmintel-complete-${selectedDate}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Error exporting complete day CSV:', error);
+    } finally {
+      setIsFullExporting(false);
+    }
+  };
+
   return (
     <div className="min-h-screen transition-colors duration-300 bg-slate-50 dark:bg-[#0B0E14] flex flex-col items-center py-6 md:py-12 px-4 md:px-6">
       <div className="w-full max-w-3xl space-y-5 md:space-y-8">
@@ -391,7 +497,10 @@ function App() {
         </main>
         
         <footer className="text-center pt-4 md:pt-8">
-          <p className="text-slate-400 dark:text-slate-600 text-[9px] md:text-[10px] font-bold uppercase tracking-widest">
+          <p
+            onClick={exportCompleteDayCSV}
+            className="text-slate-400 dark:text-slate-600 text-[9px] md:text-[10px] font-bold uppercase tracking-widest select-none"
+          >
             © 2026 FarmIntel Systems
           </p>
         </footer>
